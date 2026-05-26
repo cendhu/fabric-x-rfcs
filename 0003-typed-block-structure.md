@@ -253,6 +253,23 @@ Fabric-X already has ASN.1 signing prior art:
 
 This RFC extends that pattern to transaction-envelope submission signatures so Fabric-X uses one consistent approach for canonical signed data.
 
+# Implementation qualification metrics
+[implementation-qualification-metrics]: #implementation-qualification-metrics
+
+This RFC requires coordinated changes across multiple Fabric-X repositories. That investment should be justified by measurable improvements in the main consumers of committed blocks and by reducing structural complexity in signature verification and transaction handling.
+
+This decision is not only about performance. Fabric-X is still before production deployment, so this is the right time to correct the block structure if the typed representation is the preferred long-term contract. After production deployment, changing the block format would require a migration path, code that can process both old and new block formats, compatibility testing, and operational rollout planning. That future migration risk is part of the implementation qualification decision.
+
+A proof of concept should evaluate the following metrics before the proposal is selected for implementation:
+
+- **Committer throughput, especially the sidecar path.** Measure block and transaction processing throughput during sidecar transaction formation check. The typed structure should improve throughput by removing nested envelope, payload, and header unmarshaling from this path.
+- **`fabric-x-block-explorer` block processing cost and throughput.** The block explorer reads committed blocks and currently must unmarshal nested values to inspect transactions. Benchmarks should compare full-block decode and transaction traversal time, allocation behavior, throughput, and any relevant API response latency before and after the typed block structure.
+- **`fabric-x-evm` committed-block processing cost.** Fabric-X EVM consumes committed blocks after ordering and commit. Benchmarks should compare committed-block processing latency, CPU time, and allocation behavior when extracting and interpreting transaction data from typed envelopes instead of nested byte fields.
+- **Code complexity and code size reduction.** The implementation should reduce byte-oriented parsing paths, explicit nested unmarshal call sites, helper code that converts `Envelope` to `Payload` to `Header` to transaction-specific bytes, and the total amount of parsing/conversion code maintained by affected components. This can be evaluated by reviewing deleted parsing code, fewer conversion helpers, and simpler typed transaction access.
+- **Consistent ASN.1 signature verification.** The implementation should make submitter/orderer signature verification use canonical ASN.1 DER signing input derived from typed transaction-envelope fields, aligning this path with existing Fabric-X ASN.1 signing patterns used by committer endorsement verification and orderer consensus signatures.
+
+The primary qualification signal is a material improvement in committer sidecar throughput, because that path is the direct motivation for replacing nested byte structures. The secondary qualification signals are no regressions in `fabric-x-block-explorer` and `fabric-x-evm` committed-block processing, reduced parsing-code complexity and code size, consistent ASN.1 signing semantics, and reduced risk of a harder block-format migration after production deployment. Preliminary PoC benchmark results can be added to this section once available.
+
 # Testing
 [testing]: #testing
 
@@ -281,7 +298,7 @@ make test-integration
 make test-container
 ```
 
-Performance validation should compare before/after allocation and CPU behavior for committer transaction processing. Benchmarks should show fewer byte-slice allocations in the path that replaces nested envelope bytes with typed fields.
+Performance validation should compare before/after behavior for committer sidecar throughput, block explorer block processing, and fabric-x-evm committed-block processing.
 
 # Dependencies
 [dependencies]: #dependencies
@@ -290,6 +307,7 @@ Performance validation should compare before/after allocation and CPU behavior f
 - `fabric-x-common`: owns typed block/envelope protobufs and ASN.1 signing helpers.
 - `fabric-x-orderer`: verifies submitter signatures over ASN.1 DER typed data.
 - `fabric-x-committer`: consumes typed transaction envelopes and removes redundant byte-oriented internal paths.
+- `fabric-x-block-explorer`: consumes committed blocks and benefits from typed transaction envelopes without nested block-value unmarshaling.
 - Endorsers and Fabric Smart Client submitter code: construct typed envelopes and sign ASN.1 DER `TransactionEnvelopeToSign` bytes.
 - Protobuf generation in all affected repos.
 
@@ -297,5 +315,5 @@ Performance validation should compare before/after allocation and CPU behavior f
 [unresolved]: #unresolved-questions
 
 - Which exact `fabric-x-common` proto package and file should own the new typed block/envelope messages?
-- What exact benchmark threshold should be used to measure allocation and GC improvement?
+- What exact benchmark threshold should be used to measure committer sidecar, block explorer, and fabric-x-evm processing improvement?
 - Which endorser and Fabric Smart Client submitter components should adopt `TransactionEnvelopeToSign` helpers during initial implementation?
