@@ -76,11 +76,12 @@ For example, an application transaction envelope conceptually looks like this:
 
 ```proto
 message TransactionEnvelope {
-  TransactionHeader header = 1;
-  bytes signature = 2;
+  uint32 version = 1; // uint16 range: 0–65535
+  TransactionHeader header = 2;
+  bytes signature = 3;
   oneof transaction {
-    ApplicationTransaction application = 3;
-    ConfigTransaction config = 4;
+    ApplicationTransaction application = 4;
+    ConfigTransaction config = 5;
   }
 }
 ```
@@ -102,17 +103,19 @@ Conceptual protobuf contract:
 
 ```proto
 message Block {
-  BlockHeader header = 1;
-  repeated TransactionEnvelope transactions = 2;
-  BlockMetadata metadata = 3;
+  uint32 version = 1; // uint16 range: 0–65535
+  BlockHeader header = 2;
+  repeated TransactionEnvelope transactions = 3;
+  BlockMetadata metadata = 4;
 }
 
 message TransactionEnvelope {
-  TransactionHeader header = 1;
-  bytes signature = 2;
+  uint32 version = 1; // uint16 range: 0–65535
+  TransactionHeader header = 2;
+  bytes signature = 3;
   oneof transaction {
-    ApplicationTransaction application = 3;
-    ConfigTransaction config = 4;
+    ApplicationTransaction application = 4;
+    ConfigTransaction config = 5;
     // Future transaction types get explicit one-off fields.
   }
 }
@@ -129,11 +132,36 @@ The exact file/package placement in `fabric-x-common` should be chosen during im
 
 Validation rules:
 
+- `Block.version` is required and must be in the range 0–65535.
+- `TransactionEnvelope.version` is required and must be in the range 0–65535.
+- Parsers validate fields according to the declared version and reject unsupported versions.
 - `TransactionEnvelope.header` is required.
 - `TransactionEnvelope.signature` is required for submitted transactions.
 - Exactly one transaction variant is set.
 - `TransactionHeader.type` matches the selected transaction variant.
 - New transaction types use explicit variants, not generic `bytes data`.
+
+## Version semantics
+
+Both `Block` and `TransactionEnvelope` carry a `version` field (stored as `uint32` in protobuf, but semantically a `uint16` with values 0–65535). The version enables forward-compatible evolution of the block and transaction-envelope schemas without requiring readers to guess how to interpret the remaining fields.
+
+Version 0 is the initial version defined by this RFC. Each version designates a known set of fields, validation rules, and ASN.1 signing structure. When a new version introduces additional fields, deprecates existing fields, or changes validation semantics, the version number is incremented and the differences are documented.
+
+Parsers use the version as follows:
+
+1. **Read the version first.** Before validating any other field, the parser reads `Block.version` and `TransactionEnvelope.version`.
+2. **Dispatch to version-specific validation.** The parser selects the validation logic that corresponds to the declared version. If the version is not recognized, the parser rejects the block or envelope.
+3. **Skip unknown fields safely.** Protobuf's forward-compatible encoding means that a version-0 parser encountering a version-1 message can still decode known fields. The version tells the parser which fields are meaningful and which can be safely ignored or rejected, rather than relying on the presence or absence of individual fields to infer structure.
+4. **Sign the version.** Because `TransactionEnvelope.version` is included in the ASN.1 DER signing input, a submitter cannot sign data under one version and have the orderer or committer interpret it under a different version. This prevents version-downgrade attacks where an attacker removes or reorders fields that were introduced in a later version.
+
+`Block.version` and `TransactionEnvelope.version` are independent. A block with version 1 may contain transaction envelopes with version 0, allowing the block-level schema to evolve independently from the transaction-envelope schema. However, within a single block, all transaction envelopes should share the same version; if they do not, the parser should reject the block unless a compatibility rule is explicitly defined.
+
+When a new version is introduced, the RFC or design document that defines it must specify:
+
+- Which fields are added, removed, or deprecated.
+- Any changes to validation rules.
+- Any changes to the ASN.1 DER signing structure.
+- The minimum version a parser must support to correctly process the new version.
 
 ## ASN.1 transaction-envelope signing
 
@@ -143,10 +171,11 @@ Conceptual Go structure:
 
 ```go
 type asn1TransactionEnvelopeToSign struct {
-    Type    int
-    TxID    string `asn1:"utf8"`
-    Creator []byte
-    Nonce   []byte
+    Version  int
+    Type     int
+    TxID     string `asn1:"utf8"`
+    Creator  []byte
+    Nonce    []byte
 
     Application *asn1ApplicationTransaction `asn1:"optional"`
     Config      *asn1ConfigTransaction      `asn1:"optional"`
@@ -155,6 +184,7 @@ type asn1TransactionEnvelopeToSign struct {
 
 Included fields:
 
+- transaction envelope version
 - transaction type
 - transaction ID
 - submitter creator identity bytes
@@ -204,6 +234,10 @@ The verifier receives typed transaction data. Current endorsement verification o
 
 The new path rejects:
 
+- missing block version
+- missing transaction envelope version
+- unsupported block or transaction envelope version
+- version value outside the 0–65535 range
 - missing header
 - missing signature
 - missing creator
