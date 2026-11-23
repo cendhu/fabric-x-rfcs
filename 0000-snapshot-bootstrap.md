@@ -40,7 +40,7 @@ Future block pruning depends on this recovery path. **Pruning may be enabled onl
 
 Export copies only the selected database clone. The target uses its own signing identity, TLS credentials and connection settings. Source database roles, account passwords and unrelated databases are not copied.
 
-This is startup of a fresh deployment, not automatic repair or rollback of a running database.
+This is startup of a fresh deployment, not automatic repair or rollback of a running database. To re-bootstrap a deployment that has already started, stop its committer services and use a fresh replacement database and block store, then follow the same import/start procedure. The importer does not reset an existing started target; coordinating replacement and any repair of the old state are outside this RFC.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
@@ -52,7 +52,16 @@ This is startup of a fresh deployment, not automatic repair or rollback of a run
 3. **Start:** verify `S`, recover saved outcomes, and process original snapshot transaction `T`.
 4. **Continue:** fetch `S+1` onward and compare the target's clone hash at checkpoint `C`.
 
-Here, `S` is the snapshot-create block, `T` is its accepted snapshot transaction, and `C` is the later checkpoint transaction.
+The letters used in this RFC:
+
+| Letter | Meaning |
+|---|---|
+| `S` | The snapshot-create block. It contains `T`. |
+| `T` | The accepted snapshot transaction in `S`. |
+| `C` | The checkpoint transaction for this snapshot, in a later block. |
+| `K` | The last config block before `S`. Its policy verifies `S`. |
+| `F` | The first available block in the target's local block store. Initially `S+1`. |
+| `H` | The next block the local block store appends (logical height). Initially `S+1`. |
 
 ## Why full block `S` is needed
 
@@ -70,7 +79,7 @@ Block verification checks `S`, not every database value. The later comparison at
 Suppose `T` is in block 100 and its checkpoint is in block 120. Export the checkpointed clone:
 
 ```bash
-committer db export-snapshot \
+committer db clone export \
   --config export.yaml \
   --output snapshot-100/
 ```
@@ -96,21 +105,23 @@ Keep this block backup while the snapshot is offered for export. Export can then
 
 ## Step 2: Import into a fresh target
 
+`db clone import` consumes a snapshot clone archive and creates a fresh live database, not another clone.
+
 **Start only the target PostgreSQL server or YugabyteDB cluster. Do not start any committer service yet.** Run:
 
 ```bash
-committer db import-snapshot \
+committer db clone import \
   --config import.yaml \
   --input snapshot-100/
 ```
 
 After the full restore succeeds, importer makes three changes in one SQL transaction:
 
-1. Empty local `ns__snapshot` rows, keeping the schema.
+1. Empty organization-local snapshot bookkeeping, currently `ns__snapshot` rows, keeping the schema.
 2. Set the latest-snapshot pointer value to SQL NULL, keeping its metadata row.
 3. Set the saved last-committed block number to 99 (`S-1`).
 
-Everything else stays unchanged, including transaction statuses and MVCC versions. The source clone and archive are not changed.
+Everything outside that local bookkeeping and the two metadata values stays unchanged, including transaction statuses and MVCC versions. The source clone and archive are not changed.
 
 ## Step 3: Start and process `S`
 
@@ -118,13 +129,12 @@ Copy `boundary-block.pb` to the sidecar host and configure:
 
 ```yaml
 # Under target sidecar configuration; proposed field.
-bootstrap-snapshot-block-path: /var/lib/committer/bootstrap/boundary-block.pb
-
 orderer:
+  last-block-path: /var/lib/committer/bootstrap/boundary-block.pb
   latest-known-config-block-path: /etc/committer/latest-config.block
 ```
 
-Then start committer services. Genesis-started deployments omit the bootstrap path.
+Then start committer services. Genesis-started deployments omit `orderer.last-block-path`. Bootstrap reads the full block from this path to recover statuses and process original `T`; after `S` completes, the verified block supplies delivery's `LastBlock` seed for fetching `S+1`.
 
 The current connectivity config supplies orderer endpoints and transport trust. The historical config in the restored database supplies the policy for verifying `S`. A later connectivity config may include a new organization; it does not replace the historical verification policy.
 
@@ -138,7 +148,11 @@ Sidecar processes only original `T`. This creates the target hashing clone and l
 
 After `S` is complete, sidecar enables public query/delivery/notifications and fetches `S+1` onward. Hashing runs alongside normal processing.
 
-At `C`, existing snapshot handling waits/retries if the local hash is not ready, accepts a matching hash, and halts on mismatch. There is no extra public-service gate waiting for `C`. Results served before that comparison have not yet been verified by the local snapshot hash; a later halt cannot retract them.
+At `C`, existing snapshot handling waits/retries if the local hash is not ready, accepts a matching hash, and halts on mismatch.
+
+The exported snapshot is already `CHECKPOINTED`, so `C` is already ordered. A target catching up may reach it before its own hash is ready: expect a HOLD while the remaining hashing completes, with no retry limit and no later commits until the checkpoint is resolved. This is expected progress, not a stalled bootstrap.
+
+`C` checks the target's own snapshot record, recreated by processing original `T` after import clears the source's local records and latest pointer. There is no extra public-service gate waiting for `C`. Results served before that comparison have not yet been verified by the local snapshot hash; a later halt cannot retract them.
 
 Ordinary local history begins at `S+1`. Older block requests return unavailable; `Oldest` delivery starts at `S+1`. Clients needing earlier blocks use an archive service.
 
@@ -155,7 +169,7 @@ Require one matching `CHECKPOINTED` record, an existing completed clone with a c
 2. Clone deletion must atomically acquire a `DELETE` reference before dropping the database. It cannot proceed while an export reference exists; export cannot proceed while deletion owns the record. Both `--tx-id` and `--name` deletion paths enforce this rule. Block-backup cleanup also respects an active export reference.
 3. After backup files are complete and durable, export clears only its own reference. Deletion keeps its reference until the drop and clone-name cleanup finish. If a record update response is lost, read the record to confirm ownership before proceeding.
 
-These are short atomic record updates; no database transaction remains open during file copying. Other snapshot-record updates must preserve an active reference. All tools that delete clones must honor it before this feature is enabled.
+These are short atomic record updates; no database transaction remains open during file copying. Other snapshot-record updates must preserve an active reference. All tools that drop, rename or restore from a clone, or replace the database holding its record, must honor it before this feature is enabled. Replacing that database must not discard an active export reference while the export is still running.
 
 After interruption, retain the reference until the operation is confirmed finished or stopped. Do not clear it merely because a timeout expired: the backup process may still be running. An abandoned reference safely blocks deletion until explicit recovery. The reference is local snapshot bookkeeping, excluded from the state hash; it is not a new snapshot lifecycle status.
 
@@ -186,12 +200,12 @@ Apply all three cleanup changes together:
 
 | Object | Action |
 |---|---|
-| `ns__snapshot` | Empty rows; retain schema, indexes and functions; no cascading deletion |
+| Organization-local snapshot bookkeeping (currently `ns__snapshot`) | Empty rows; retain schema, indexes and functions; no cascading deletion |
 | Latest-snapshot metadata | Set SQL NULL value; retain row |
 | Last-committed metadata | Set `S-1` using existing eight-byte big-endian encoding |
-| Everything else | Preserve, including statuses, checkpoints and MVCC versions |
+| Everything outside the listed cleanup targets | Preserve, including statuses, checkpoints and MVCC versions |
 
-Snapshot bookkeeping and recovery metadata are excluded from the state hash. All changes commit or roll back together. Keep the pointer row: `SnapshotStateManager.ReadLatest` expects it.
+Cleanup covers all source organization-local snapshot bookkeeping excluded from the state hash, including per-snapshot digest records if a future schema stores them separately from `ns__snapshot`. Supported schemas must explicitly identify those objects; exclusion from the state hash alone is not permission to clear unrelated metadata or hashed state. Snapshot bookkeeping and recovery metadata are excluded from the state hash. All changes commit or roll back together. Keep the pointer row: `SnapshotStateManager.ReadLatest` expects it.
 
 Validate cleanup before reporting success or starting services. Retry only on the same owned, fully restored target before processing begins. Never reset a started target. Older local records remain in archive bytes, not the cleaned target.
 
@@ -199,7 +213,9 @@ Validate cleanup before reporting success or starting services. Retry only on th
 
 Read historical config from restored `ns__config`. Its config transaction status identifies config block `K`; require `K<S` and matching channel/last-config metadata. Current orderer connection settings remain separate.
 
-Verify `S`'s number, channel, config, data hash and orderer signatures under that historical policy. Apply normal transaction checks to `T`. Use [RFC 0003][block-hash-rfc]'s channel-selected block-data hash; absent/empty scheme name means `SHA256_FLAT`, and unknown schemes fail. Setting `SessionInfo.LastBlock` alone is not verification: `newBlockProcessingState` does not authenticate that seed.
+Verify `S`'s number, channel, config, data hash and orderer signatures under that historical policy. Apply normal transaction checks to `T`. Use [RFC 0003][block-hash-rfc]'s channel-selected block-data hash; absent/empty scheme name means `SHA256_FLAT`, and unknown schemes fail. Setting `SessionInfo.LastBlock` alone is not verification: `newBlockProcessingState` does not authenticate that seed. Loading `orderer.last-block-path` therefore does not replace these checks.
+
+For normal delivery/recovery, use a block as `LastBlock` only when its number is exactly `nextBlockNum-1`. Prefer that exact block from the local block store when available. A configured full block is a fallback only when it matches the required predecessor and any saved bootstrap boundary, subject to verification. Completed-bootstrap restart may instead use the durable boundary/config as described below. Do not select the newest block or let a stale configured file override advanced progress. During incomplete bootstrap, `S` is recovery input, not the seed for fetching `S` itself; it becomes the delivery seed only after processing `T` and saving the watermark at `S`.
 
 Only the predecessor link from `S-1` to `S` cannot be checked, because no authenticated `S-1` is supplied. Data-hash and signature checks remain mandatory. Changing transaction bytes/TX ID breaks the data hash; changing the header to match breaks its signatures.
 
@@ -247,11 +263,19 @@ The required order is: **save boundary → complete `T` → save watermark → f
 | Boundary matches `S`, watermark at least `S` | Preserve advanced height/watermark; use normal recovery |
 | Missing/conflicting boundary after progress, wrong record or missing required status | Fail; do not reset or relabel the ledger |
 
-`H=S+1` alone does not prove completion. Keep staged `S` through incomplete retries; after completion, saved boundary/config can support restart without it. Resolve lost watermark responses by reading status, record and watermark. Reuse pre-commit clones only after checking ownership/native completion. Repair interrupted PostgreSQL connection exclusion through maintenance recovery. Missing active clone is an error; deleted older terminal clones do not trigger rehash.
+`H=S+1` alone does not prove completion. Keep staged full block `S` through bootstrap retries and until matching checkpoint `C` commits locally, making the target snapshot `CHECKPOINTED`. After that durable commit, the target may remove the staged file; saved boundary/config support restart without it. HOLD, mismatch HALT or an abort does not authorize this removal. This target-side cleanup does not remove the source's block backup while the snapshot is offered for export. Resolve lost watermark responses by reading status, record and watermark. Reuse pre-commit clones only after checking ownership/native completion. Repair interrupted PostgreSQL connection exclusion through maintenance recovery. Missing active clone is an error; deleted older terminal clones do not trigger rehash.
 
 Below `F`, unary history requests return gRPC `OutOfRange`; delivery seeks immediately return `NOT_FOUND`, including blocking seeks. `Oldest` starts at `F`; `Newest` at `H=F` has no stored block. Cached/indexed entries cannot bypass this bound. Missing historical TX indexes do not prove a TX never existed.
 
 Orderers must serve `S+1` onward, including `C`. Missing blocks cause visible retry/failure, never a height jump. Checkpoint match, HOLD, HALT and abort behavior follow RFC 0004.
+
+## Blockstore rollback at the bootstrap boundary
+
+Snapshot-aware `blkstorage.Rollback` must reject targets below `F-1`. For a bootstrap store whose first available block is still `F=S+1`, allow target `S` even though `S` is not an ordinary stored block. Rollback to `S` removes all ordinary blocks from `S+1` onward and their indexes, invalidates affected caches, resets the index savepoint to `S`, and leaves a boundary-only store with `H=S+1`. Preserve the saved bootstrap boundary, its hashes and historical verification config; do not append `S`, delete the boundary or initialize a genesis ledger. If the store is already boundary-only, rollback to `S` is a no-op. Rollback to a retained ordinary block removes only blocks after that target and leaves `H=target+1`.
+
+Perform rollback only while committer services and the block store are closed. Its crash recovery must leave block files, indexes and logical height consistent with the rollback target. If future pruning advances `F` beyond `S+1`, the rollback floor advances to `F-1`; the saved origin at `S` does not make pruned history available again.
+
+Blockstore rollback does not restore database state or change its watermark. A separate repair procedure may restore a pre-`T` database clone with watermark `S-1`, then recover original `T` from full block `S` without appending it, save watermark `S`, and resume intake at `S+1`. That procedure requires full `S` to remain available. The target retains its staged copy until matching `C` commits, as required above; this rollback contract does not add automatic repair or guarantee local replay of `T` after that copy is removed.
 
 # Drawbacks
 [drawbacks]: #drawbacks
@@ -297,13 +321,14 @@ Orderers may have removed `S` while still serving `S+1` onward. Requiring that f
 
 Compare state, versions, statuses and later transaction outcomes between full replay and snapshot bootstrap. Cover:
 
-1. **Export:** valid/deleted/corrupt selection; competing export/delete claims through both selectors; lost claim/release responses; stopped versus still-running abandoned operations; complete files and manifest-last publication. Export works after ordinary history loses `S`.
+1. **Export:** valid/deleted/corrupt selection; competing export/delete claims through both selectors; drop/rename/restore/database-replacement protection during export; lost claim/release responses; stopped versus still-running abandoned operations; complete files and manifest-last publication. Export works after ordinary history loses `S`.
 2. **Block backup:** incomplete backups are rejected; complete backups remain available through authorized reads during export. Cleanup and pruning cannot remove a backup still in use.
-3. **Import:** DB-only setup, native completion/ownership, rollback of all cleanup actions, retained NULL pointer row and unchanged hashed data. Retry cannot reset a started target.
-4. **Verification:** changed TX ID/data/header/signatures, wrong config/channel/height, supported/unknown hash schemes and unverified `LastBlock` seed. Check links from `S+1`.
+3. **Import:** DB-only setup, native completion/ownership, rollback of all cleanup actions, retained NULL pointer row, complete organization-local bookkeeping cleanup and unchanged hashed data/unrelated metadata. Retry cannot reset a started target; re-bootstrap uses fresh replacement storage after stopping the old deployment.
+4. **Verification:** changed TX ID/data/header/signatures, wrong config/channel/height, supported/unknown hash schemes and unverified `LastBlock` seed. Cover full-block `orderer.last-block-path` input, exact predecessor selection, stored-block precedence, and stale-file rejection without resetting advanced progress. Check links from `S+1`.
 5. **Recovery:** saved statuses, duplicate/malformed positions, only missing `T` execution, crash windows around boundary/clone/watermark writes, native retry and preserved progress. Never append/publish `S`.
-6. **Checkpoint/config:** match, HOLD, mismatch HALT, abort and later config changes. Missing blocks never cause a height jump.
+6. **Checkpoint/config:** match against the recreated target record, expected HOLD during bootstrap hashing, mismatch HALT, abort and later config changes. Keep staged `S` through retries, HOLD, HALT and abort; allow its removal only after a durable matching `C` commit, then verify restart without the file using saved boundary/config. Source block-backup retention remains independent. Missing blocks never cause a height jump.
 7. **Native transport:** PostgreSQL version/locale/ownership; YugabyteDB complete tablets/replicas, catalog consistency, clone prerequisites and 3→5/5→3 RF=3 restores.
+8. **Blockstore rollback:** reject targets below `F-1`; rollback to `S` at `F=S+1` leaves `H=S+1` with the boundary/config intact, no ordinary blocks and no stale indexes or caches. Cover repeated boundary-only rollback, rollback to retained ordinary blocks, crash recovery, unchanged database watermark and reopen/append of `S+1` linked to saved `S`.
 
 Measure export, restore, cleanup, clone creation, hashing and catch-up separately. Each implementation PR includes tests/docs. Run focused tests locally and full suite in CI.
 
@@ -312,7 +337,7 @@ Measure export, restore, cleanup, clone creation, hashing and catch-up separatel
 
 - **[RFC 0004][snapshot-rfc]:** snapshot transactions, clones, local records, hashing and checkpoint behavior.
 - **[RFC 0003][block-hash-rfc]:** historical channel's block-data hash scheme.
-- **`fabric-x-common`:** shared snapshot-record operation reference, saved bootstrap boundary/config and metadata-only initialization; preserve existing import APIs.
+- **`fabric-x-common`:** shared snapshot-record operation reference, saved bootstrap boundary/config, metadata-only initialization and snapshot-aware blockstore rollback; preserve existing import APIs.
 - **`fabric-x-committer`:** export/import commands, clone-reference enforcement, source block backup/read, cleanup and sidecar startup using existing recovery.
 - **Deployment:** compatible native tools, target capacity/clone prerequisites, local signing/TLS credentials and orderers serving `S+1` onward.
 - **[RFC 0002][sdk-rfc] clients:** honor oldest-available history and typed unavailable results.
@@ -324,7 +349,7 @@ Online pruning and general block-history archives do not gate bootstrap implemen
 
 ## Implementation details
 
-- Operation-reference encoding, abandoned-operation recovery and enforcement by all clone-deletion tools.
+- Operation-reference encoding, abandoned-operation recovery and enforcement by all tools that drop, rename or restore from clones, or replace the database holding the reference.
 - Backup-read API, access/size/time limits and cleanup protection.
 - Narrow snapshot-record read if needed, plus existing recovery/no-append integration.
 - Native ownership/retry procedures, supported version/topology matrix and archive compatibility fields.
