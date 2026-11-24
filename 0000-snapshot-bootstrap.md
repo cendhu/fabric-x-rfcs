@@ -13,19 +13,21 @@ SPDX-License-Identifier: Apache-2.0
 - Feature Name: snapshot_bootstrap
 - Start Date: 2026-11-11
 - RFC PR:
-- Fabric-X Component: fabric-x-committer (database CLI, sidecar, coordinator, validator-committer, snapshot hasher), fabric-x-common
-- Fabric-X Issue:
+- Chaguar Component: committer (database CLI, sidecar, coordinator, validator-committer, snapshot hasher), common
+- Chaguar Issue:
 
 > Draft proposal. The RFC number and submission links are unassigned.
 
 # Summary
 [summary]: #summary
 
-This RFC lets a new Fabric-X committer start from a database backup instead of replaying the entire channel history.
+This RFC lets a new Chaguar committer start from a database backup instead of replaying the entire channel history.
 
 The source exports a checkpointed database clone together with block `S`, which contains snapshot transaction `T`. The target imports the database, verifies `S`, and uses existing recovery to find the saved outcomes of the other transactions. It then processes original `T` and starts fetching blocks from `S+1`.
 
 Processing `T` creates the target's hashing clone. The target compares its hash with the hash in a later checkpoint transaction `C`. A match confirms the restored state's integrity under the channel's trust model; a mismatch halts processing.
+
+`T` and `C` are data transactions opaque to orderers; orderers order them but do not interpret their snapshot or checkpoint semantics.
 
 This RFC builds on [RFC 0004 — Database Snapshot and Checkpoint][snapshot-rfc]. Online pruning and general block-history archives are separate future work.
 
@@ -303,6 +305,8 @@ Changing the original clone would alter the source snapshot. Cleaning a separate
 ## Fetch block `S` from orderers during startup
 
 Orderers may have removed `S` while still serving `S+1` onward. Requiring that fetch would make an otherwise usable database backup unavailable for bootstrap. The design packages backed-up `S`; later blocks are still fetched from orderers.
+
+If a future orderer-pruning design guarantees retention of `S` and every later block for a supported bootstrap snapshot, startup could fetch `S` instead. That would allow replacing the source block backup/read API and the archive's `boundary-block.pb` with orderer delivery. This RFC does not require that retention guarantee.
 
 ## Use a whole-server PostgreSQL physical backup
 
